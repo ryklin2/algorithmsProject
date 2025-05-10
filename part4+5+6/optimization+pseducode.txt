@@ -1,0 +1,10 @@
+4. algorithm planning:
+	
+	a few of the more basic things from the brute force can be held over like the fuel checks and how we develop the cost itself
+	the main time saving angle in our math comes from avoiding needing to calculate every possible route to compare.
+	I kind of like a greedy approach since no matter what we do, we cut some corners, but I think I'll settle on A* with some partitioning and other basic sorting out
+	
+
+5. pseudocode
+//first step partition our network
+	

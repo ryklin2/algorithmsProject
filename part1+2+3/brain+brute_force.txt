@@ -1,0 +1,222 @@
+
+problem: design self driving strategy with algorithms
+
+
+1. Brainstorming:
+assume:
+optimal tour route from pickup to destination
+
+maximize profit by reducing car travel by reducing recharge frequency 
+	=> use as little electricity as possible and charge at lowest energy assuming some kind of next trip length?
+	=>traffic causes electricity costs to increase, but we are commited to the optimal tour by distance or by electricity?
+	
+minimize customer cost with dynamic pricing?
+	-demand based => more demand => lower prices (traditional taxis kind of work this way if you can find people to share a ride with you)
+	
+vehical availability impacts route selection?????
+	fewer cars means you have less routes?
+	
+	
+	
+if we make a graph:
+	nodes: 	
+	charging stations (charge rate included. that can differ), 			
+	traffic stops (intersections/exit holdups), 
+	customer locations+destinations, (could be like heatmapped or just assumed to general shared ones?)
+	maybe proper routing stuff like highway on-ramps and exists, general stuff that traffic flow is designed around
+	could probably come up with something else to turn into nodes to, but basically anything we might want to put edges between, especially if the node itself could have some sort of cost
+	
+edges:
+	distance (default)
+	add onto the edge value with traffic level
+	subtract from it by demand level
+	estimate electricity cost from elevation change scalar, speed limit, traffic scalar, stop/go-ishness
+	required charge from taking route
+	honestly the nodes are more focused, but we could add TONS of shit to make our edges more optimal
+	
+potential algorithms of use:
+djikistra?
+BFS?
+A*
+graph partitioning (we ignore all but a local subset of our graph to focus on more calculations between a certain set of nodes/edges)
+
+I'm actually looking at some interesting open source projects+papers for similar ideas:
+https://github.com/Telenav/open-source-spec/blob/master/routing_basic/doc/crp.md
+https://github.com/Telenav/open-source-spec/blob/master/routing_basic/doc/graph_partition.md
+https://project-osrm.org/
+https://valhalla.github.io/valhalla/
+https://github.com/valhalla/valhalla
+https://mapsplatform.google.com/maps-products/routes/
+the google maps api actually has some neat ideas in their advertising like optimizing for different types of vehicles.
+	
+	
+class Node:
+  - id
+  - location (coordinates)
+  - is_charging_station (boolean)
+  - additional_properties (e.g., amenities)
+
+class Edge:
+  - source_node
+  - target_node
+  - distance
+  -elevation, but elevation could be included as part of the traffic scalar or something too?
+  - traffic_level (dynamic)
+  -traffic_level (predicted or regular)
+  - demand_level (dynamic)
+  -demand_level (predicted or regular)
+  - electricity_consumption_rate
+  - price_factor
+  
+  for some of these factors, getting the info and quanitifying them is their entire own new function and algorithm that I think could be left out as they'd be similar projects in terms of scope each on their own.
+  
+
+cost functions (well, a few of them):
+
+electricity_used = base_electricity_rate * distance * traffic_scalar * 
+
+price = base_price_rate * distance / (demand_scalar)
+
+profit = customer_price - electricity costs - operation_upkeep_costs
+
+
+considerations:
+traffic and demand change constantly
+I don't know a lot about how stop lights work and they're main traffic gates in urban areas
+
+optimal tour might always not be most battery or time efficient, but let's just assume it ishness
+
+even with just a 2 digit number of nodes, this could get out of hand to an ABSURD degree
+
+battery technology is kind of behind where it should be and is closed source....
+
+would a computer even be able to or want to make these calculations on the spot quickly? the customer is waiting, we'd probably want most of this pre-done and cached somewhere
+
+urban and rural optimizations might differ
+
+can we integrate both real time traffic and predicted pattern traffic?
+
+how do we quantify each step into our edges
+how do we go from location with a phone's GPS to a starting node?
+each step is a thing we express with words we need to turn into numbers and back.
+Valhalla for instance, uses data endpoints from OpenStreetMap to get its inputs
+
+A* is very intensive so we would need very small numbers of nodes and very large numbers of partitions which would still result in large numbers of nodes in larger graphs where each parititon is a node.
+
+
+REMEMBER MAIN INSTRUCTION RULES:
+COMPANY PROFIT (MAXIMIZE)
+CUSTOMER COST (MINIMIZE)
+TOUR COST (MINIMIZE in terms of fuel/time/distance)
+
+
+
+
+
+2. brute force approach:
+enumerate all possible paths from start node to end node,
+pick the shortest one using above factors like distance, traffic, high demand lowering the price (I still don't really get this, but I don't make the rules), increasing profits by lowering charging spending
+select the shortest path.
+
+side loop (this is so small in comparison to the rest of this it barely matters):
+if it's a path that exceeds remaining fuel, charge up first
+if it's a path that exceeds total fuel, charge up partway.
+
+brute force pseudocode:
+function findOptimalRoute(graph, pickup, destination, batteryCapacity, currentBatteryLevel):
+    allPaths = []
+    profitByPath = {}
+    customerCostByPath = {}
+    
+    // Step 1: Generate all possible paths
+    function generateAllPaths(currentNode, destinationNode, currentPath, visitedNodes):
+        if currentNode == destinationNode:
+            allPaths.append(copy(currentPath))
+            return
+            
+        visitedNodes.add(currentNode)
+        
+        for each neighbor in graph.getNeighbors(currentNode):
+            if neighbor not in visitedNodes:
+                currentPath.append(neighbor)
+                generateAllPaths(neighbor, destinationNode, currentPath, visitedNodes)
+                currentPath.pop()  // Backtrack
+                
+        visitedNodes.remove(currentNode)
+    
+    // call the recursive function to generate all paths
+    generateAllPaths(pickup, destination, [pickup], set())
+    
+    // Step 2: Evaluate each path
+    for path in allPaths:
+        remainingBattery = currentBatteryLevel
+        totalElectricityUsed = 0
+        totalCustomerCost = 0
+        isPathFeasible = true
+        
+        for i from 0 to path.length - 2:
+            currentNode = path[i]
+            nextNode = path[i+1]
+            edge = graph.getEdge(currentNode, nextNode)
+            
+            // calculate electricity consumption based on traffic
+            electricityForSegment = edge.distance * (1 + edge.trafficLevel * TRAFFIC_FACTOR)
+            
+            //check if battery is sufficient
+            if remainingBattery < electricityForSegment:
+                // Need to recharge???
+                if currentNode.hasChargingStation:
+                    // Recharging cost (time and money)
+                    rechargeCost = calculateRechargeCost(remainingBattery, batteryCapacity)
+                    totalElectricityUsed += rechargeCost
+                    remainingBattery = batteryCapacity
+                else:
+                    // Can't complete this path without running out of battery
+                    isPathFeasible = false
+                    break
+            
+            // Update battery level
+            remainingBattery -= electricityForSegment
+            totalElectricityUsed += electricityForSegment
+            
+            // Calculate customer cost based on demand (inverse surge pricing)
+            segmentCost = edge.distance * BASE_PRICE * (1 / (1 + edge.demandLevel * DEMAND_FACTOR))
+            totalCustomerCost += segmentCost
+        
+        if isPathFeasible:
+            // Calculate company profit
+            profit = totalCustomerCost - totalElectricityUsed * ELECTRICITY_COST
+            
+            profitByPath[path] = profit
+            customerCostByPath[path] = totalCustomerCost
+    
+    // Step 3: Select the optimal path (maximizing profit, minimizing customer cost)
+    // We could use a weighted approach to balance the two objectives
+    bestPath = null
+    bestScore = 0
+    
+    for path in profitByPath.keys():
+        // Normalize values between 0 and 1
+        normalizedProfit = profitByPath[path] / max(profitByPath.values())
+        normalizedCost = 1 - (customerCostByPath[path] / max(customerCostByPath.values()))
+        
+        // Weighted score (can adjust weights based on company priorities)
+        score = PROFIT_WEIGHT * normalizedProfit + CUSTOMER_COST_WEIGHT * normalizedCost
+        
+        if score > bestScore:
+            bestScore = score
+            bestPath = path
+    
+    return bestPath
+
+
+
+3. time complexity of brute force
+this is like a terrible version of distance matrix problems we've done in class.
+this gets so big and out of hand on such an atrocious level. And we'd probably need one for every hour of each day of the week and some extra stuff for holiday or event traffic.
+Assuming E is our number of edges in the graph, then this is O(E!) time and space compllexity.  This is a ludicrously awful approach.  Let alone for a potentially infinite number of nodes and edges.
+
+We've already done a really good job quantifying it into a graph in idea, but there's probably even dumber solutions that are still much better because the brute force is too much, we can partition and compartmentalize, and maybe generalize/simplify a few things that are a litlte extraneous.
+At this point we'd be better off using existing map APIs and just borrowing google or someone else's pre-existing work.
+And that work already uses similar shortcut ideas to what I've suggested by focusing traffic into main freeways entrances as nodes even then connecting those to more minor directions.
+I don't want to know what that level of API access costs though, especially if we were doing it live, but we could handle that with the graph partitioning.
