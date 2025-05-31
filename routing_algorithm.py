@@ -10,7 +10,7 @@ demand-based pricing, and vehicle availability.
 import heapq
 import math
 from enum import Enum
-from typing import Dict, List, Set, Tuple, Optional, NamedTuple
+from typing import Dict, List, Set, Tuple, Optional, NamedTuple, Union
 
 # -----------------------------------------------------------------------------
 # CONSTANTS AND CONFIGURATION
@@ -302,7 +302,7 @@ def heuristic(current_node_id: int, destination_id: int, graph: Graph) -> float:
 # -----------------------------------------------------------------------------
 
 def find_optimal_route(graph: Graph, pickup_id: int, destination_id: int, 
-                      battery_capacity: float, current_battery_level: float) -> Dict:
+                      battery_capacity: float, current_battery_level: float) -> Optional[Dict]:
     """
     Find the optimal route from pickup to destination using Enhanced A*.
     Considers battery constraints, traffic, demand, and vehicle availability.
@@ -386,6 +386,11 @@ def find_optimal_route(graph: Graph, pickup_id: int, destination_id: int,
                 
             # Get the edge
             edge = graph.get_edge(current_state.node_id, neighbor_id)
+            
+            # Skip if edge doesn't exist
+            if edge is None:
+                continue
+                
             neighbor_partition = find_containing_partition(neighbor_id, partitions)
             
             # Calculate costs - skip edges with no available vehicles
@@ -446,7 +451,7 @@ def find_optimal_route(graph: Graph, pickup_id: int, destination_id: int,
     # No path found
     return None
 
-def reconstruct_path(came_from, final_state, g_score, graph, paths):
+def reconstruct_path(came_from, final_state, g_score, graph, paths) -> Dict:
     """
     Reconstruct the path from start to destination and calculate metrics.
     Uses pre-computed paths to avoid having to walk back through came_from.
@@ -482,7 +487,7 @@ def reconstruct_path(came_from, final_state, g_score, graph, paths):
         'cost': g_score[final_state]
     }
 
-def count_available_vehicles(graph: Graph, node_id: int = None, radius: int = None) -> dict:
+def count_available_vehicles(graph: Graph, node_id: Optional[int] = None, radius: Optional[int] = None) -> dict:
     """
     Count available vehicles in the network or around a specific node.
     
@@ -638,8 +643,8 @@ def create_grid_test_graph(size=5):
     
     for i in range(size):
         for j in range(size):
-            x = j * 10
-            y = i * 10
+            x = float(j * 10)
+            y = float(i * 10)
             
             # Determine road type
             if i == 2 or j == 2:  # Main roads
@@ -843,8 +848,6 @@ def run_grid_test():
     else:
         print("No valid route found.")
 
-
-
 def run_different_starting_nodes_test():
     """Test routing from different starting nodes in the network."""
     print("\n=== TEST: ROUTING FROM DIFFERENT STARTING NODES ===")
@@ -919,7 +922,6 @@ def run_cross_network_test():
         print(f"Profit: ${result['profit']:.2f}")
     else:
         print("No valid route found")
-
 
 def create_simple_urban_graph(size=5, area_size=0.5):
     """
@@ -1137,9 +1139,12 @@ def run_urban_test_3():
         print(f"Path length: {len(result['path'])} nodes")
         
         # Analyze if route is longer due to detours
-        straight_path_nodes = max(abs(graph.nodes[start_id].coords.x - graph.nodes[end_id].coords.x),
-                                 abs(graph.nodes[start_id].coords.y - graph.nodes[end_id].coords.y)) / \
-                             (graph.nodes[2].coords.x - graph.nodes[1].coords.x) + 1
+        start_coords = graph.nodes[start_id].coords
+        end_coords = graph.nodes[end_id].coords
+        spacing = (graph.nodes[2].coords.x - graph.nodes[1].coords.x) if len(graph.nodes) > 1 else 1.0
+        
+        straight_path_nodes = max(abs(start_coords.x - end_coords.x),
+                                 abs(start_coords.y - end_coords.y)) / spacing + 1
         
         detour_factor = len(result['path']) / straight_path_nodes
         print(f"Detour factor: {detour_factor:.2f}x")
