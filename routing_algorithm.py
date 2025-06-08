@@ -5,12 +5,28 @@ This simplified proof-of-concept demonstrates an optimized routing algorithm for
 self-driving electric cars that finds the most profitable and cost-effective route
 from pickup to destination while considering battery constraints, traffic conditions,
 demand-based pricing, and vehicle availability.
+
+Enhanced with proper geographic distance calculations for real-world accuracy.
 """
 
 import heapq
 import math
 from enum import Enum
 from typing import Dict, List, Set, Tuple, Optional, NamedTuple, Union
+
+# Optional geographic libraries for enhanced accuracy
+try:
+    from geopy.distance import geodesic, great_circle
+    from geopy import Point
+    GEOPY_AVAILABLE = True
+except ImportError:
+    GEOPY_AVAILABLE = False
+
+try:
+    import pyproj
+    PYPROJ_AVAILABLE = True
+except ImportError:
+    PYPROJ_AVAILABLE = False
 
 # -----------------------------------------------------------------------------
 # CONSTANTS AND CONFIGURATION
@@ -29,6 +45,10 @@ TRAFFIC_IMPACT_FACTOR = 0.5  # How much traffic affects consumption
 BASE_PRICE = 2.0              # Base price per mile
 ELECTRICITY_COST_PER_UNIT = 0.1  # Cost per mile of range
 DEMAND_DISCOUNT_FACTOR = 0.2  # How much demand reduces price (inverse surge)
+
+# Geographic constants
+METERS_TO_MILES = 0.000621371  # Conversion factor from meters to miles
+MILES_TO_METERS = 1609.34      # Conversion factor from miles to meters
 
 # -----------------------------------------------------------------------------
 # ENUMS AND DATA CLASSES
@@ -51,25 +71,242 @@ class PartitionType(Enum):
     ARTERIAL_LEVEL = 2  # Arterial roads network
     HIGHWAY_LEVEL = 3   # Highway network
 
+class CoordinateSystem(Enum):
+    """Different coordinate systems supported."""
+    WGS84_LATLON = "wgs84"  # Standard GPS coordinates (latitude, longitude)
+    UTM = "utm"             # Universal Transverse Mercator
+    STATE_PLANE = "state_plane"  # US State Plane coordinates
+    CARTESIAN = "cartesian"  # Simple x,y coordinates (for testing)
+
+class DistanceMethod(Enum):
+    """Different distance calculation methods."""
+    EUCLIDEAN = "euclidean"     # Straight-line distance (original method)
+    HAVERSINE = "haversine"     # Great circle distance on sphere
+    VINCENTY = "vincenty"       # High-precision ellipsoid distance
+    GEODESIC = "geodesic"       # Most accurate for real Earth
+    MANHATTAN = "manhattan"     # City block distance
+    AUTO = "auto"              # Automatically choose best method
+
 class Coordinates:
-    """Geographic coordinates for nodes in the network."""
-    def __init__(self, x: float, y: float):
+    """
+    Enhanced coordinates class with proper geographic distance calculations.
+    Maintains the same interface as the original for backward compatibility.
+    """
+    def __init__(self, x: float, y: float, 
+                 coord_system: CoordinateSystem = CoordinateSystem.CARTESIAN,
+                 zone: Optional[str] = None):
+        """
+        Initialize coordinates.
+        
+        Args:
+            x: X coordinate (longitude if lat/lon, easting if projected)
+            y: Y coordinate (latitude if lat/lon, northing if projected)
+            coord_system: Coordinate system being used
+            zone: UTM zone or other projection zone if applicable
+        """
         self.x = x
         self.y = y
+        self.coord_system = coord_system
+        self.zone = zone
+        
+        # Validate coordinates based on system
+        self._validate_coordinates()
     
-    def distance_to(self, other: 'Coordinates') -> float:
-        """Calculate Euclidean distance to another point."""
+    def _validate_coordinates(self):
+        """Validate coordinates based on coordinate system."""
+        if self.coord_system == CoordinateSystem.WGS84_LATLON:
+            if not (-90 <= self.y <= 90):
+                raise ValueError(f"Invalid latitude: {self.y}")
+            if not (-180 <= self.x <= 180):
+                raise ValueError(f"Invalid longitude: {self.x}")
+    
+    @property
+    def latitude(self) -> float:
+        """Get latitude (y coordinate for lat/lon systems)."""
+        if self.coord_system == CoordinateSystem.WGS84_LATLON:
+            return self.y
+        else:
+            raise ValueError("Latitude only available for lat/lon coordinate systems")
+    
+    @property
+    def longitude(self) -> float:
+        """Get longitude (x coordinate for lat/lon systems)."""
+        if self.coord_system == CoordinateSystem.WGS84_LATLON:
+            return self.x
+        else:
+            raise ValueError("Longitude only available for lat/lon coordinate systems")
+    
+    def distance_to(self, other: 'Coordinates', 
+                   method: DistanceMethod = DistanceMethod.AUTO) -> float:
+        """
+        Calculate distance to another coordinate point.
+        Returns distance in miles to maintain compatibility with existing code.
+        
+        Args:
+            other: Target coordinates
+            method: Distance calculation method
+            
+        Returns:
+            Distance in miles (same units as original implementation)
+        """
+        if self.coord_system != other.coord_system:
+            raise ValueError("Cannot calculate distance between different coordinate systems")
+        
+        # Choose method automatically if AUTO is selected
+        if method == DistanceMethod.AUTO:
+            method = self._choose_optimal_method(other)
+        
+        if method == DistanceMethod.EUCLIDEAN:
+            distance = self._euclidean_distance(other)
+        elif method == DistanceMethod.HAVERSINE:
+            distance = self._haversine_distance(other)
+        elif method == DistanceMethod.VINCENTY or method == DistanceMethod.GEODESIC:
+            distance = self._geodesic_distance(other, method)
+        elif method == DistanceMethod.MANHATTAN:
+            distance = self._manhattan_distance(other)
+        else:
+            raise ValueError(f"Unsupported distance method: {method}")
+        
+        # Convert to miles if we calculated in meters
+        if self.coord_system == CoordinateSystem.WGS84_LATLON and method != DistanceMethod.EUCLIDEAN:
+            distance = distance * METERS_TO_MILES
+        
+        return distance
+    
+    def _choose_optimal_method(self, other: 'Coordinates') -> DistanceMethod:
+        """Choose the optimal distance calculation method."""
+        if self.coord_system == CoordinateSystem.CARTESIAN:
+            return DistanceMethod.EUCLIDEAN
+        elif self.coord_system == CoordinateSystem.WGS84_LATLON:
+            # For GPS coordinates, use geodesic if available, otherwise haversine
+            if GEOPY_AVAILABLE:
+                return DistanceMethod.GEODESIC
+            else:
+                return DistanceMethod.HAVERSINE
+        else:
+            return DistanceMethod.EUCLIDEAN
+    
+    def _euclidean_distance(self, other: 'Coordinates') -> float:
+        """Calculate Euclidean distance (original method)."""
         return math.sqrt((self.x - other.x)**2 + (self.y - other.y)**2)
+    
+    def _manhattan_distance(self, other: 'Coordinates') -> float:
+        """Calculate Manhattan (city block) distance."""
+        return abs(self.x - other.x) + abs(self.y - other.y)
+    
+    def _haversine_distance(self, other: 'Coordinates') -> float:
+        """
+        Calculate Haversine distance (great circle distance on sphere).
+        Returns distance in meters.
+        """
+        if self.coord_system != CoordinateSystem.WGS84_LATLON:
+            raise ValueError("Haversine distance requires lat/lon coordinates")
+        
+        # Convert to radians
+        lat1, lon1 = math.radians(self.y), math.radians(self.x)
+        lat2, lon2 = math.radians(other.y), math.radians(other.x)
+        
+        # Haversine formula
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        
+        a = (math.sin(dlat/2)**2 + 
+             math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2)
+        c = 2 * math.asin(math.sqrt(a))
+        
+        # Earth's radius in meters
+        earth_radius = 6371000
+        
+        return earth_radius * c
+    
+    def _geodesic_distance(self, other: 'Coordinates', 
+                          method: DistanceMethod) -> float:
+        """
+        Calculate geodesic distance using geopy if available.
+        Falls back to Haversine if geopy not available.
+        Returns distance in meters.
+        """
+        if self.coord_system != CoordinateSystem.WGS84_LATLON:
+            raise ValueError("Geodesic distance requires lat/lon coordinates")
+        
+        if GEOPY_AVAILABLE:
+            point1 = Point(latitude=self.y, longitude=self.x)
+            point2 = Point(latitude=other.y, longitude=other.x)
+            
+            if method == DistanceMethod.VINCENTY:
+                # Use great_circle for Vincenty-style calculation
+                return great_circle(point1, point2).meters
+            else:
+                # Use geodesic for most accurate calculation
+                return geodesic(point1, point2).meters
+        else:
+            # Fall back to Haversine
+            return self._haversine_distance(other)
+    
+    def bearing_to(self, other: 'Coordinates') -> float:
+        """
+        Calculate initial bearing (direction) to another point.
+        Returns bearing in degrees (0-360, where 0 is North).
+        """
+        if self.coord_system != CoordinateSystem.WGS84_LATLON:
+            # For non-geographic coordinates, calculate angle from x-axis
+            dx = other.x - self.x
+            dy = other.y - self.y
+            angle = math.degrees(math.atan2(dy, dx))
+            return (angle + 360) % 360
+        
+        lat1, lon1 = math.radians(self.y), math.radians(self.x)
+        lat2, lon2 = math.radians(other.y), math.radians(other.x)
+        
+        dlon = lon2 - lon1
+        
+        y = math.sin(dlon) * math.cos(lat2)
+        x = (math.cos(lat1) * math.sin(lat2) - 
+             math.sin(lat1) * math.cos(lat2) * math.cos(dlon))
+        
+        bearing = math.atan2(y, x)
+        bearing = math.degrees(bearing)
+        bearing = (bearing + 360) % 360  # Normalize to 0-360
+        
+        return bearing
+    
+    def __str__(self) -> str:
+        """String representation of coordinates."""
+        if self.coord_system == CoordinateSystem.WGS84_LATLON:
+            return f"({self.y:.6f}°N, {self.x:.6f}°E)"
+        else:
+            return f"({self.x:.2f}, {self.y:.2f}) [{self.coord_system.value}]"
 
 class Node:
     """Represents an intersection or point of interest in the road network."""
     def __init__(self, id: int, coords: Coordinates, road_type: RoadType, 
-                 has_charging_station: bool = False):
+                 has_charging_station: bool = False,
+                 elevation: Optional[float] = None,
+                 city: Optional[str] = None,
+                 state: Optional[str] = None):
         self.id = id
         self.coords = coords
         self.road_type = road_type
         self.has_charging_station = has_charging_station
+        self.elevation = elevation  # Elevation in meters (optional)
+        self.city = city           # City name (optional)
+        self.state = state         # State/province (optional)
         self.is_near_highway = road_type == RoadType.HIGHWAY or False
+    
+    def distance_to(self, other: 'Node', 
+                   method: DistanceMethod = DistanceMethod.AUTO) -> float:
+        """Calculate distance to another node in miles."""
+        return self.coords.distance_to(other.coords, method)
+    
+    def bearing_to(self, other: 'Node') -> float:
+        """Calculate bearing to another node in degrees."""
+        return self.coords.bearing_to(other.coords)
+    
+    def elevation_gain_to(self, other: 'Node') -> float:
+        """Calculate elevation gain to another node in meters."""
+        if self.elevation is None or other.elevation is None:
+            return 0.0
+        return max(0.0, other.elevation - self.elevation)
     
     def __eq__(self, other):
         if not isinstance(other, Node):
@@ -706,6 +943,214 @@ def create_grid_test_graph(size=5):
     
     return graph
 
+def create_simple_urban_graph(size=5, area_size=0.5):
+    """
+    Create a small urban test graph with high traffic and many nodes.
+    Uses smaller area size and more charging stations.
+    """
+    graph = Graph()
+    
+    # Calculate spacing between nodes (smaller for dense urban areas)
+    spacing = area_size / (size - 1) if size > 1 else 1.0
+    
+    # Create nodes in a grid pattern
+    nodes = []
+    node_id = 1
+    
+    for i in range(size):
+        for j in range(size):
+            x = j * spacing
+            y = i * spacing
+            
+            # Determine road type (mostly local roads in urban areas)
+            if i % 3 == 0 or j % 3 == 0:  # Major streets
+                road_type = RoadType.ARTERIAL
+            elif i % 5 == 0 and j % 5 == 0:  # Few highways/expressways
+                road_type = RoadType.HIGHWAY
+            else:
+                road_type = RoadType.LOCAL
+            
+            # Add more charging stations (every 3 nodes instead of 4)
+            has_charging = (i % 3 == 0 and j % 3 == 0)
+            
+            node = Node(node_id, Coordinates(x, y), road_type, has_charging)
+            nodes.append(node)
+            graph.add_node(node)
+            node_id += 1
+    
+    # Connect nodes in grid pattern with moderately high traffic
+    for i in range(size):
+        for j in range(size):
+            current_idx = i * size + j
+            current_node = nodes[current_idx]
+            
+            # Connect to right neighbor if not at right edge
+            if j < size - 1:
+                right_idx = i * size + (j + 1)
+                right_node = nodes[right_idx]
+                
+                # Urban traffic is high but not excessive
+                traffic = min(0.8, 0.3 + ((i + j) % 6) * 0.08)
+                
+                graph.add_edge(Edge(
+                    current_node, right_node, spacing,
+                    traffic_level=traffic,
+                    demand_level=0.3 + ((i + j) % 5) * 0.1,
+                    vehicle_availability=0.7 - ((i + j) % 6) * 0.1
+                ))
+                
+                graph.add_edge(Edge(
+                    right_node, current_node, spacing,
+                    traffic_level=traffic + 0.05,
+                    demand_level=0.3 + ((j + i) % 5) * 0.1,
+                    vehicle_availability=0.7 - ((j + i) % 6) * 0.1
+                ))
+            
+            # Connect to below neighbor if not at bottom edge
+            if i < size - 1:
+                below_idx = (i + 1) * size + j
+                below_node = nodes[below_idx]
+                
+                # Urban traffic is high but not excessive
+                traffic = min(0.8, 0.3 + ((i + j) % 5) * 0.08)
+                
+                graph.add_edge(Edge(
+                    current_node, below_node, spacing,
+                    traffic_level=traffic,
+                    demand_level=0.3 + ((i + j) % 4) * 0.1,
+                    vehicle_availability=0.7 - ((i + j) % 5) * 0.1
+                ))
+                
+                graph.add_edge(Edge(
+                    below_node, current_node, spacing,
+                    traffic_level=traffic + 0.05,
+                    demand_level=0.3 + ((j + i) % 4) * 0.1,
+                    vehicle_availability=0.7 - ((j + i) % 5) * 0.1
+                ))
+    
+    # Add some diagonal connections for more routing options
+    for i in range(size - 1):
+        for j in range(size - 1):
+            current_idx = i * size + j
+            diag_idx = (i + 1) * size + (j + 1)
+            
+            # Only add diagonal if pattern matches (deterministic alternative to random)
+            if (i + j) % 3 == 0:
+                current_node = nodes[current_idx]
+                diag_node = nodes[diag_idx]
+                
+                diag_distance = spacing * 1.414  # Diagonal distance (√2 * spacing)
+                
+                # Diagonal connections with moderate traffic
+                traffic = min(0.8, 0.4 + ((i + j) % 5) * 0.08)
+                
+                graph.add_edge(Edge(
+                    current_node, diag_node, diag_distance,
+                    traffic_level=traffic,
+                    demand_level=0.2 + ((i + j) % 4) * 0.1,
+                    vehicle_availability=0.6 - ((i + j) % 4) * 0.1
+                ))
+    
+    return graph
+
+def create_real_world_graph():
+    """
+    Create a test graph using real-world GPS coordinates.
+    Example using Bay Area coordinates.
+    """
+    graph = Graph()
+    
+    # Real GPS coordinates for Bay Area locations
+    locations = [
+        # (name, latitude, longitude, road_type, has_charging)
+        ("San Francisco Downtown", 37.7749, -122.4194, RoadType.ARTERIAL, True),
+        ("Oakland", 37.8044, -122.2712, RoadType.ARTERIAL, True),
+        ("San Jose", 37.3382, -121.8863, RoadType.ARTERIAL, True),
+        ("Palo Alto", 37.4419, -122.1430, RoadType.ARTERIAL, False),
+        ("Fremont", 37.5485, -121.9886, RoadType.LOCAL, False),
+        ("Redwood City", 37.4852, -122.2364, RoadType.LOCAL, True),
+        ("Highway 101 North", 37.6000, -122.3000, RoadType.HIGHWAY, False),
+        ("Highway 880 Junction", 37.7000, -122.2000, RoadType.HIGHWAY, False),
+    ]
+    
+    # Create nodes with real coordinates
+    nodes = []
+    for i, (name, lat, lon, road_type, has_charging) in enumerate(locations, 1):
+        coords = Coordinates(lon, lat, CoordinateSystem.WGS84_LATLON)
+        node = Node(i, coords, road_type, has_charging, city=name.split()[0])
+        nodes.append(node)
+        graph.add_node(node)
+    
+    # Create edges between nearby locations
+    connections = [
+        (1, 2, 0.3, 0.5),  # SF to Oakland
+        (1, 4, 0.2, 0.6),  # SF to Palo Alto
+        (1, 6, 0.1, 0.7),  # SF to Redwood City
+        (2, 5, 0.4, 0.4),  # Oakland to Fremont
+        (2, 8, 0.1, 0.8),  # Oakland to Highway 880
+        (3, 4, 0.2, 0.6),  # San Jose to Palo Alto
+        (3, 5, 0.3, 0.5),  # San Jose to Fremont
+        (4, 6, 0.1, 0.7),  # Palo Alto to Redwood City
+        (6, 7, 0.1, 0.8),  # Redwood City to Highway 101
+        (7, 8, 0.2, 0.6),  # Highway connections
+    ]
+    
+    for source_id, target_id, traffic, demand in connections:
+        source_node = nodes[source_id - 1]
+        target_node = nodes[target_id - 1]
+        
+        # Calculate real distance using enhanced coordinates
+        distance = source_node.coords.distance_to(target_node.coords)
+        
+        # Create bidirectional edges
+        graph.add_edge(Edge(
+            source_node, target_node, distance,
+            traffic_level=traffic,
+            demand_level=demand,
+            vehicle_availability=0.8
+        ))
+        
+        graph.add_edge(Edge(
+            target_node, source_node, distance,
+            traffic_level=traffic + 0.1,
+            demand_level=demand,
+            vehicle_availability=0.8
+        ))
+    
+    return graph
+
+def test_coordinate_accuracy():
+    """Test the accuracy of different distance calculation methods."""
+    print("\n=== COORDINATE ACCURACY TEST ===")
+    
+    # Test with real Bay Area coordinates
+    sf = Coordinates(-122.4194, 37.7749, CoordinateSystem.WGS84_LATLON)
+    oakland = Coordinates(-122.2712, 37.8044, CoordinateSystem.WGS84_LATLON)
+    
+    methods = [DistanceMethod.EUCLIDEAN, DistanceMethod.HAVERSINE]
+    if GEOPY_AVAILABLE:
+        methods.append(DistanceMethod.GEODESIC)
+    
+    print("San Francisco to Oakland:")
+    for method in methods:
+        try:
+            distance = sf.distance_to(oakland, method)
+            print(f"  {method.value}: {distance:.2f} miles")
+        except Exception as e:
+            print(f"  {method.value}: Error - {e}")
+    
+    # Test with cartesian coordinates (should match original)
+    coord1 = Coordinates(0, 0)
+    coord2 = Coordinates(10, 0)
+    print(f"\nCartesian test (0,0) to (10,0): {coord1.distance_to(coord2):.2f} units")
+
+def get_cardinal_direction(bearing: float) -> str:
+    """Convert bearing to cardinal direction."""
+    directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                 "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    index = round(bearing / 22.5) % 16
+    return directions[index]
+
 def run_basic_example():
     """Run a simple example to demonstrate the routing algorithm."""
     # Create test graph
@@ -737,6 +1182,47 @@ def run_basic_example():
             print("\nRoute includes charging at nodes:", charging_stations)
     else:
         print("No valid route found.")
+
+def run_real_world_example():
+    """Run routing example with real-world coordinates."""
+    print("\n=== REAL-WORLD ROUTING EXAMPLE ===")
+    
+    graph = create_real_world_graph()
+    
+    # Route from San Francisco to San Jose
+    pickup_id = 1   # San Francisco
+    destination_id = 3  # San Jose
+    
+    result = find_optimal_route(graph, pickup_id, destination_id, 100.0, 80.0)
+    
+    if result:
+        print("Real-world route (SF to San Jose):")
+        print(f"Path: {result['path']}")
+        print(f"Distance: {result['distance']:.2f} miles")
+        print(f"Electricity Used: {result['electricity']:.2f} miles of range")
+        print(f"Customer Cost: ${result['customer_cost']:.2f}")
+        print(f"Profit: ${result['profit']:.2f}")
+        
+        # Show route with city names
+        route_cities = []
+        for node_id in result['path']:
+            node = graph.nodes[node_id]
+            if hasattr(node, 'city') and node.city:
+                route_cities.append(node.city)
+        
+        if route_cities:
+            print(f"Route cities: {' -> '.join(route_cities)}")
+        
+        # Calculate bearings between waypoints
+        print("\nRoute bearings:")
+        for i in range(len(result['path']) - 1):
+            current_node = graph.nodes[result['path'][i]]
+            next_node = graph.nodes[result['path'][i + 1]]
+            bearing = current_node.coords.bearing_to(next_node.coords)
+            direction = get_cardinal_direction(bearing)
+            print(f"  {current_node.id} to {next_node.id}: {bearing:.1f}° ({direction})")
+    else:
+        print("No route found")
 
 def run_low_battery_test():
     """Test routing with low battery to demonstrate charging behavior."""
@@ -922,116 +1408,6 @@ def run_cross_network_test():
         print(f"Profit: ${result['profit']:.2f}")
     else:
         print("No valid route found")
-
-def create_simple_urban_graph(size=5, area_size=0.5):
-    """
-    Create a small urban test graph with high traffic and many nodes.
-    Uses smaller area size and more charging stations.
-    """
-    graph = Graph()
-    
-    # Calculate spacing between nodes (smaller for dense urban areas)
-    spacing = area_size / (size - 1) if size > 1 else 1.0
-    
-    # Create nodes in a grid pattern
-    nodes = []
-    node_id = 1
-    
-    for i in range(size):
-        for j in range(size):
-            x = j * spacing
-            y = i * spacing
-            
-            # Determine road type (mostly local roads in urban areas)
-            if i % 3 == 0 or j % 3 == 0:  # Major streets
-                road_type = RoadType.ARTERIAL
-            elif i % 5 == 0 and j % 5 == 0:  # Few highways/expressways
-                road_type = RoadType.HIGHWAY
-            else:
-                road_type = RoadType.LOCAL
-            
-            # Add more charging stations (every 3 nodes instead of 4)
-            has_charging = (i % 3 == 0 and j % 3 == 0)
-            
-            node = Node(node_id, Coordinates(x, y), road_type, has_charging)
-            nodes.append(node)
-            graph.add_node(node)
-            node_id += 1
-    
-    # Connect nodes in grid pattern with moderately high traffic
-    for i in range(size):
-        for j in range(size):
-            current_idx = i * size + j
-            current_node = nodes[current_idx]
-            
-            # Connect to right neighbor if not at right edge
-            if j < size - 1:
-                right_idx = i * size + (j + 1)
-                right_node = nodes[right_idx]
-                
-                # Urban traffic is high but not excessive
-                traffic = min(0.8, 0.3 + ((i + j) % 6) * 0.08)
-                
-                graph.add_edge(Edge(
-                    current_node, right_node, spacing,
-                    traffic_level=traffic,
-                    demand_level=0.3 + ((i + j) % 5) * 0.1,
-                    vehicle_availability=0.7 - ((i + j) % 6) * 0.1
-                ))
-                
-                graph.add_edge(Edge(
-                    right_node, current_node, spacing,
-                    traffic_level=traffic + 0.05,
-                    demand_level=0.3 + ((j + i) % 5) * 0.1,
-                    vehicle_availability=0.7 - ((j + i) % 6) * 0.1
-                ))
-            
-            # Connect to below neighbor if not at bottom edge
-            if i < size - 1:
-                below_idx = (i + 1) * size + j
-                below_node = nodes[below_idx]
-                
-                # Urban traffic is high but not excessive
-                traffic = min(0.8, 0.3 + ((i + j) % 5) * 0.08)
-                
-                graph.add_edge(Edge(
-                    current_node, below_node, spacing,
-                    traffic_level=traffic,
-                    demand_level=0.3 + ((i + j) % 4) * 0.1,
-                    vehicle_availability=0.7 - ((i + j) % 5) * 0.1
-                ))
-                
-                graph.add_edge(Edge(
-                    below_node, current_node, spacing,
-                    traffic_level=traffic + 0.05,
-                    demand_level=0.3 + ((j + i) % 4) * 0.1,
-                    vehicle_availability=0.7 - ((j + i) % 5) * 0.1
-                ))
-    
-    # Add some diagonal connections for more routing options
-    for i in range(size - 1):
-        for j in range(size - 1):
-            current_idx = i * size + j
-            diag_idx = (i + 1) * size + (j + 1)
-            
-            # Only add diagonal if pattern matches (deterministic alternative to random)
-            if (i + j) % 3 == 0:
-                current_node = nodes[current_idx]
-                diag_node = nodes[diag_idx]
-                
-                diag_distance = spacing * 1.414  # Diagonal distance (√2 * spacing)
-                
-                # Diagonal connections with moderate traffic
-                traffic = min(0.8, 0.4 + ((i + j) % 5) * 0.08)
-                
-                graph.add_edge(Edge(
-                    current_node, diag_node, diag_distance,
-                    traffic_level=traffic,
-                    demand_level=0.2 + ((i + j) % 4) * 0.1,
-                    vehicle_availability=0.6 - ((i + j) % 4) * 0.1
-                ))
-    
-    return graph
 
 def run_urban_test_1():
     """Test routing in a dense urban grid with heavy traffic."""
@@ -1275,11 +1651,35 @@ def run_urban_tests():
     run_urban_test_4()
     run_urban_test_5()
 
+def print_initialization_info():
+    """Print information about available geographic libraries."""
+    print("Enhanced Routing Algorithm with Geographic Coordinates")
+    print("=" * 60)
+    print(f"Geographic libraries available:")
+    print(f"  geopy: {'✓' if GEOPY_AVAILABLE else '✗'} (for accurate distance calculations)")
+    print(f"  pyproj: {'✓' if PYPROJ_AVAILABLE else '✗'} (for coordinate transformations)")
+    
+    if not GEOPY_AVAILABLE:
+        print("\nFor better accuracy with GPS coordinates, install geopy:")
+        print("  pip install geopy")
+    
+    if not PYPROJ_AVAILABLE:
+        print("\nFor coordinate system transformations, install pyproj:")
+        print("  pip install pyproj")
+    
+    print()
+
 def run_all_tests():
     """Run all test cases to demonstrate the algorithm."""
+    # Test coordinate accuracy first
+    test_coordinate_accuracy()
+    
     # Basic example
     print("\n=== BASIC ROUTING EXAMPLE ===")
     run_basic_example()
+    
+    # Real-world example with GPS coordinates
+    run_real_world_example()
     
     # Low battery test
     run_low_battery_test()
@@ -1304,4 +1704,5 @@ def run_all_tests():
 
 # Run all tests
 if __name__ == "__main__":
+    print_initialization_info()
     run_all_tests()
